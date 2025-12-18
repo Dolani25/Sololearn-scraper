@@ -18,6 +18,8 @@ const CONFIG = {
 // --- HELPER: GET TOKEN VIA PUPPETEER ---
 async function getAuthToken() {
     console.log('🔑 Launching browser to fetch fresh token...');
+    
+    // Launch browser (using minimal resources)
     const browser = await puppeteer.launch({
         headless: 'new',
         args: [
@@ -67,16 +69,15 @@ async function getAuthToken() {
         await page.type('input[type="email"]', CONFIG.email);
         await page.type('input[type="password"]', CONFIG.password);
         
-        // 5. Submit and Wait for Network Idle (Token is generated here)
+        // 5. Submit and Wait for Network Idle
         await Promise.all([
             page.waitForNavigation({ waitUntil: 'networkidle2' }),
             page.click('button[type="submit"]')
         ]);
 
         // 6. Steal the Token from LocalStorage
-        // SoloLearn stores the JWT in localStorage under keys like 'token' or 'access_token'
         const token = await page.evaluate(() => {
-            return localStorage.getItem('token') || localStorage.getItem('accessToken') || localStorage.getItem('access_token');
+            return localStorage.getItem('token') || localStorage.getItem('access_token');
         });
 
         if (!token) {
@@ -90,19 +91,20 @@ async function getAuthToken() {
         console.error('Login failed:', error.message);
         throw error;
     } finally {
-        await browser.close(); // KILL BROWSER IMMEDIATELY TO FREE RAM
+        // CRITICAL: Close browser immediately to free memory
+        await browser.close(); 
     }
 }
 
 // --- API ROUTE ---
 app.get('/scrape', async (req, res) => {
-  const profileUrl = req.query.url; // e.g., https://www.sololearn.com/en/profile/10453904
+  const profileUrl = req.query.url;
 
   if (!profileUrl) {
     return res.status(400).json({ error: 'Missing "url" query parameter' });
   }
 
-  // Extract ID from URL (e.g., 10453904)
+  // Extract ID from URL
   const idMatch = profileUrl.match(/profile\/(\d+)/);
   const userId = idMatch ? idMatch[1] : null;
 
@@ -113,15 +115,14 @@ app.get('/scrape', async (req, res) => {
   console.log(`🚀 Starting optimized scrape for ID: ${userId}`);
 
   try {
-      // Step 1: Get Token (Uses Puppeteer for ~10 seconds)
+      // Step 1: Get Token (Browser runs briefly)
       const token = await getAuthToken();
 
-      // Step 2: Use Axios for Data (Super Fast, Low Memory)
+      // Step 2: Use Axios for Data (Super Fast)
       const followers = [];
       let page = 1;
       let hasMore = true;
 
-      // Headers from your Inspection
       const headers = {
           'Authorization': `Bearer ${token}`,
           'Accept': 'application/json, text/plain, */*',
@@ -132,7 +133,7 @@ app.get('/scrape', async (req, res) => {
 
       console.log('⚡ Starting API download loop...');
 
-      while (hasMore && page < 50) { // Safety limit of 50 pages (5000 followers)
+      while (hasMore && page < 100) { 
           const apiUrl = `https://api2.sololearn.com/v2/userinfo/v3/profile/${userId}/followers?count=100&page=${page}`;
           
           try {
@@ -140,11 +141,12 @@ app.get('/scrape', async (req, res) => {
               const data = response.data.data;
 
               if (data && data.length > 0) {
-                  followers.push(...data.map(u => u.name)); // Just saving names
+                  const names = data.map(u => u.name);
+                  followers.push(...names);
                   console.log(`   Page ${page}: Found ${data.length} followers`);
                   
                   if (data.length < 100) {
-                      hasMore = false; // Last page reached
+                      hasMore = false;
                   } else {
                       page++;
                   }
@@ -173,96 +175,3 @@ app.get('/scrape', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-    page.on('request', (req) => {
-      if (['image', 'stylesheet', 'font'].includes(req.resourceType())) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-
-    const navigationOptions = { waitUntil: 'domcontentloaded', timeout: 120000 };
-
-    // --- LOGIN ---
-    console.log('📍 Navigating to login...');
-    await page.goto(CONFIG.loginUrl, navigationOptions);
-
-    // Cookie Consent
-    try {
-        const cookieBtn = await page.$('button'); 
-        if(cookieBtn) await cookieBtn.click();
-    } catch (e) {}
-
-    // "See more options"
-    try {
-        await page.waitForSelector('a', { timeout: 5000 });
-        const links = await page.$$('a');
-        for (const link of links) {
-            const text = await page.evaluate(el => el.textContent, link);
-            if (text.includes('See more options')) {
-                await link.click();
-                break;
-            }
-        }
-    } catch(e) {}
-
-    // Type Credentials
-    await page.waitForSelector('input[type="email"]', { timeout: 60000 });
-    await page.type('input[type="email"]', CONFIG.email);
-    await page.type('input[type="password"]', CONFIG.password);
-    
-    await Promise.all([
-        page.waitForNavigation(navigationOptions),
-        page.click('button[type="submit"]')
-    ]);
-    console.log('✅ Login successful');
-
-    // --- PROFILE ---
-    console.log(`📍 Navigating to profile: ${profileUrl}`);
-    await page.goto(profileUrl, navigationOptions);
-
-    // Open Followers Modal
-    console.log('Searching for Followers button...');
-    try {
-        await page.waitForFunction(
-            () => [...document.querySelectorAll('button')].some(b => b.textContent.includes('Followers')),
-            { timeout: 30000 }
-        );
-
-        await page.evaluate(() => {
-            const buttons = Array.from(document.querySelectorAll('button'));
-            const btn = buttons.find(b => b.textContent.includes('Followers'));
-            if (btn) btn.click();
-        });
-        
-        await page.waitForSelector('div[role="dialog"]', { timeout: 30000 });
-    } catch (e) {
-        throw new Error('Could not open followers modal (Profile might be private or changed).');
-    }
-
-    // Scroll
-    console.log('⬇️ Scrolling...');
-    await scrollFollowersModal(page);
-
-    // Extract
-    const followers = await extractFollowers(page);
-
-    await browser.close();
-
-    res.json({
-        success: true,
-        count: followers.length,
-        followers: followers
-    });
-
-  } catch (error) {
-    console.error('❌ Error:', error.message);
-    if (browser) await browser.close();
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
