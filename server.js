@@ -76,7 +76,7 @@ async function getAuthToken() {
         // 6. Steal the Token from LocalStorage
         // SoloLearn stores the JWT in localStorage under keys like 'token' or 'access_token'
         const token = await page.evaluate(() => {
-            return localStorage.getItem('token') || localStorage.getItem('access_token');
+            return localStorage.getItem('token') || localStorage.getItem('accessToken') || localStorage.getItem('access_token');
         });
 
         if (!token) {
