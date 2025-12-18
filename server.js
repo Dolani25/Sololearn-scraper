@@ -5,15 +5,13 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware to parse JSON
 app.use(express.json());
 
-// Configuration
+// CONFIG
 const CONFIG = {
-  email: process.env.SOLO_EMAIL,       // Set these in Render Environment Variables
-  password: process.env.SOLO_PASSWORD, 
+  email: process.env.SOLO_EMAIL,
+  password: process.env.SOLO_PASSWORD,
   loginUrl: 'https://www.sololearn.com/en/users/login',
-  headless: 'new', // New headless mode for performance
 };
 
 app.get('/scrape', async (req, res) => {
@@ -28,30 +26,45 @@ app.get('/scrape', async (req, res) => {
   let browser = null;
   
   try {
-    // Launch browser with arguments required for Docker/Cloud environments
+    // 1. Launch with Memory-Saving Flags
     browser = await puppeteer.launch({
-      headless: CONFIG.headless,
+      headless: 'new',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage', // Vital for Docker memory management
-        '--single-process' // Vital for some cloud environments
+        '--disable-dev-shm-usage', // Vital for Docker
+        '--disable-gpu',           // Saves Memory
+        '--no-zygote',             // Saves Memory
+        // '--single-process'      // REMOVED: Causes crashes on modern Chrome
       ],
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null // uses bundled chromium if null
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null,
+      protocolTimeout: 120000, // Wait up to 2 mins for browser to respond
     });
 
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 720 });
+    
+    // 2. Block images/css to save bandwidth & memory
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      if (['image', 'stylesheet', 'font'].includes(req.resourceType())) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
 
-    // --- LOGIN LOGIC ---
+    // 3. Set a HUGE timeout (2 minutes) because free servers are slow
+    const navigationOptions = { waitUntil: 'domcontentloaded', timeout: 120000 };
+
+    // --- LOGIN ---
     console.log('📍 Navigating to login...');
-    await page.goto(CONFIG.loginUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+    await page.goto(CONFIG.loginUrl, navigationOptions);
 
-    // Handle Cookie Consent
+    // Handle Cookie Consent (Fast check)
     try {
-        const cookieBtn = await page.$('button'); // Simplified selector
+        const cookieBtn = await page.$('button'); 
         if(cookieBtn) await cookieBtn.click();
-    } catch (e) { console.log('No cookie popup'); }
+    } catch (e) {}
 
     // Find "See more options"
     try {
@@ -64,41 +77,112 @@ app.get('/scrape', async (req, res) => {
                 break;
             }
         }
-    } catch(e) { console.log('See more options check skipped'); }
+    } catch(e) {}
 
-    // Type Credentials
-    await page.waitForSelector('input[type="email"]');
+    // Login
+    await page.waitForSelector('input[type="email"]', { timeout: 60000 });
     await page.type('input[type="email"]', CONFIG.email);
     await page.type('input[type="password"]', CONFIG.password);
     
     await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle2' }),
+        page.waitForNavigation(navigationOptions),
         page.click('button[type="submit"]')
     ]);
     console.log('✅ Login successful');
 
-    // --- PROFILE NAVIGATION ---
+    // --- PROFILE ---
     console.log(`📍 Navigating to profile: ${profileUrl}`);
-    await page.goto(profileUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+    await page.goto(profileUrl, navigationOptions);
 
     // Open Followers Modal
+    console.log('Searching for Followers button...');
     try {
-        // Look for buttons containing "Followers" text specifically
-        const followersBtn = await page.evaluateHandle(() => {
+        // Wait specifically for the button to appear in DOM
+        await page.waitForFunction(
+            () => [...document.querySelectorAll('button')].some(b => b.textContent.includes('Followers')),
+            { timeout: 30000 }
+        );
+
+        // Click it
+        await page.evaluate(() => {
             const buttons = Array.from(document.querySelectorAll('button'));
-            return buttons.find(b => b.textContent.includes('Followers'));
+            const btn = buttons.find(b => b.textContent.includes('Followers'));
+            if (btn) btn.click();
         });
         
-        if (followersBtn) {
-            await followersBtn.click();
-            await page.waitForSelector('div[role="dialog"]', { timeout: 10000 });
-        } else {
-            throw new Error('Followers button not found');
-        }
+        await page.waitForSelector('div[role="dialog"]', { timeout: 30000 });
     } catch (e) {
-        throw new Error('Could not open followers modal. Is the profile public?');
+        throw new Error('Could not open followers modal. ' + e.message);
     }
 
+    // Scroll
+    console.log('⬇️ Scrolling...');
+    await scrollFollowersModal(page);
+
+    // Extract
+    const followers = await extractFollowers(page);
+
+    await browser.close();
+
+    res.json({
+        success: true,
+        count: followers.length,
+        followers: followers
+    });
+
+  } catch (error) {
+    console.error('❌ Error:', error.message);
+    if (browser) await browser.close();
+    res.status(500).json({ error: error.message });
+  }
+});
+
+async function scrollFollowersModal(page) {
+  const modalSelector = 'div[role="dialog"]';
+  let previousHeight = 0;
+  let attempts = 0;
+  
+  while (attempts < 30) { 
+    const currentHeight = await page.evaluate((sel) => {
+      const modal = document.querySelector(sel);
+      if (modal) {
+        modal.scrollTop = modal.scrollHeight;
+        return modal.scrollHeight;
+      }
+      return 0;
+    }, modalSelector);
+
+    if (currentHeight === previousHeight) break;
+    previousHeight = currentHeight;
+    await new Promise(r => setTimeout(r, 1000));
+    attempts++;
+  }
+}
+
+async function extractFollowers(page) {
+    return await page.evaluate(() => {
+        const followers = [];
+        const seen = new Set();
+        const modal = document.querySelector('div[role="dialog"]');
+        if (!modal) return [];
+        const items = modal.querySelectorAll('div'); 
+        items.forEach(el => {
+            if(el.textContent.includes('Follow') && !el.textContent.includes('Followers')) {
+                const lines = el.innerText.split('\n');
+                const name = lines[0];
+                if(name && !seen.has(name) && name !== 'Follow') {
+                    followers.push(name);
+                    seen.add(name);
+                }
+            }
+        });
+        return followers;
+    });
+}
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
     // Scroll Logic
     console.log('⬇️ Scrolling...');
     await scrollFollowersModal(page);
